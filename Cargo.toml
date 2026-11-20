@@ -2,19 +2,21 @@
 name = "Rust-Telegram-Bot"
 version = "0.1.0"
 edition = "2024"
+description = "Simple example of async Telegram bot in Rust"
+readme = "README.md"
+repository = "https://github.com/Romacat2/Rust-Telegram-Bot"
+license = "MIT"
+publish = false
 
 [dependencies]
 dotenvy = "*"
-serde = { version = "*", features = ["derive"] }
-serde_json = "*"
+telegram-bot-lite = { path = "crates/telegram-bot-lite" }
 time-format = "*"
-webpki-roots = "*"
 
-# ---  Async ---
-async-executor = "*"
-async-io = "*"
-futures-lite = "*"
-futures-rustls = "*"
+# --- Transition ---
+async-executor = ">0.0.0"
+async-io = ">0.0.0"
+futures-lite = ">0.0.0"
 
 [profile.release]
 opt-level = 2
