@@ -27,6 +27,18 @@ pub struct Message {
     pub document: Option<Document>,
 }
 
+/// The result of a `getFile` call. `file_path` is relative to
+/// `https://api.telegram.org/file/bot<token>/`, not a local path.
+#[derive(Debug, Clone, Deserialize)]
+pub struct File {
+    pub file_id: String,
+    pub file_unique_id: String,
+    #[serde(default)]
+    pub file_size: Option<i64>,
+    #[serde(default)]
+    pub file_path: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct PhotoSize {
     pub file_id: String,

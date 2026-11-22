@@ -5,6 +5,8 @@ edition = "2024"
 description = "A minimal async Telegram Bot API client built on async-io and rustls, with no I/O dependencies on logging."
 repository = "https://github.com/Romacat2/Rust-Telegram-Bot"
 license = "MIT"
+keywords = ["async", "bot", "telegram"]
+categories = ["api-bindings", "asynchronous"]
 publish = true
 
 [dependencies]

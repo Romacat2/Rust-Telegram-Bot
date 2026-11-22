@@ -108,13 +108,45 @@ async fn handle_message(bot: &Telegram, message: Message) {
     let chat_id = message.chat.id;
 
     if let Some(photo) = &message.photo {
-        log::info(&format!(
-            "Отримано фото від chat_id={chat_id}, розмірів: {}",
-            photo.len()
-        ));
-        let _ = bot
-            .send_message(chat_id, "Гарне фото! 📸", SendMessageOptions::new())
-            .await;
+        // Telegram sends several sizes, largest last.
+        if let Some(largest) = photo.last() {
+            log::info(&format!(
+                "Отримано фото від chat_id={chat_id}, {}x{}",
+                largest.width, largest.height
+            ));
+
+            let _ = bot.send_chat_action(chat_id, "typing").await;
+
+            match bot.download(&largest.file_id).await {
+                Ok(bytes) => {
+                    let path = format!("downloads/{}.jpg", largest.file_unique_id);
+                    if let Err(e) = std::fs::create_dir_all("downloads")
+                        .and_then(|_| std::fs::write(&path, &bytes))
+                    {
+                        log::error(&format!("Не вдалося зберегти фото: {e}"));
+                    } else {
+                        log::info(&format!("Фото збережено: {path} ({} байт)", bytes.len()));
+                        let _ = bot
+                            .send_message(
+                                chat_id,
+                                "Гарне фото! 📸 Збережено.",
+                                SendMessageOptions::new(),
+                            )
+                            .await;
+                    }
+                }
+                Err(e) => {
+                    log::error(&format!("Не вдалося завантажити фото: {e}"));
+                    let _ = bot
+                        .send_message(
+                            chat_id,
+                            "Не вдалося обробити фото 😕",
+                            SendMessageOptions::new(),
+                        )
+                        .await;
+                }
+            }
+        }
         return;
     }
 
@@ -153,6 +185,18 @@ async fn handle_message(bot: &Telegram, message: Message) {
                 log::error(&format!("Не вдалося відправити /help: {e}"));
             }
         }
+        "/clear" => {
+            if let Err(e) = bot.delete_message(chat_id, message.message_id).await {
+                log::error(&format!("Не вдалося видалити повідомлення: {e}"));
+                let _ = bot
+                    .send_message(
+                        chat_id,
+                        "Не можу видалити повідомлення (можливо, бракує прав адміністратора).",
+                        SendMessageOptions::new(),
+                    )
+                    .await;
+            }
+        }
         "/fact" | "🔥 Факт" => send_fact(bot, chat_id, None).await,
         "/photo" | "🖼️ Картинка" => send_rust_photo(bot, chat_id, None).await,
         _ => {}
@@ -188,6 +232,23 @@ async fn handle_callback_query(bot: &Telegram, callback: CallbackQuery) {
                 send_rust_photo(bot, chat_id, None).await;
             }
         }
+        "another_fact" => {
+            let _ = bot.answer_callback_query(&callback.id, None, false).await;
+            if let Some(message) = &callback.message {
+                let text = FACTS[rand_index()];
+                if let Err(e) = bot
+                    .edit_message_text(
+                        message.chat.id,
+                        message.message_id,
+                        text,
+                        SendMessageOptions::new().reply_markup(fact_keyboard()),
+                    )
+                    .await
+                {
+                    log::error(&format!("Не вдалося відредагувати факт: {e}"));
+                }
+            }
+        }
         other => {
             let _ = bot
                 .answer_callback_query(&callback.id, Some(&format!("Невідома дія: {other}")), true)
@@ -196,11 +257,23 @@ async fn handle_callback_query(bot: &Telegram, callback: CallbackQuery) {
     }
 }
 
-async fn send_fact(bot: &Telegram, chat_id: i64, reply_to: Option<i64>) {
-    let text = "Цікавий факт: Rust вже 9 років поспіль займає перше місце як \"найулюбленіша мова \
-         програмування\" у StackOverflow Survey.";
+fn fact_keyboard() -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup::row(vec![InlineKeyboardButton::callback(
+        "🔄 Ще факт",
+        "another_fact",
+    )])
+}
 
-    let mut options = SendMessageOptions::new();
+const FACTS: &[&str] = &[
+    "Цікавий факт: Rust вже 9 років поспіль займає перше місце як \"найулюбленіша мова програмування\" у StackOverflow Survey.",
+    "Цікавий факт: компілятор Rust спершу був написаний на OCaml.",
+    "Цікавий факт: назва \"Rust\" походить від грибка-іржі (rust fungi), який є \"дуже стійким\".",
+];
+
+async fn send_fact(bot: &Telegram, chat_id: i64, reply_to: Option<i64>) {
+    let text = FACTS[rand_index()];
+
+    let mut options = SendMessageOptions::new().reply_markup(fact_keyboard());
     if let Some(id) = reply_to {
         options = options.reply_to_message_id(id);
     }
@@ -210,8 +283,18 @@ async fn send_fact(bot: &Telegram, chat_id: i64, reply_to: Option<i64>) {
     }
 }
 
+fn rand_index() -> usize {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    (nanos as usize) % FACTS.len()
+}
+
 /// Sends a small Rust logo PNG, to demonstrate `send_photo`
 async fn send_rust_photo(bot: &Telegram, chat_id: i64, reply_to: Option<i64>) {
+    let _ = bot.send_chat_action(chat_id, "upload_photo").await;
+
     let mut options = SendMessageOptions::new();
     if let Some(id) = reply_to {
         options = options.reply_to_message_id(id);

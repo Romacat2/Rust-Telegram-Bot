@@ -5,7 +5,7 @@ use serde::Deserialize;
 
 use crate::http::{self, Body, HttpError, MultipartForm};
 use crate::types::envelope::ApiResponse;
-use crate::types::{Me, ReplyMarkup, Update};
+use crate::types::{File, Me, ReplyMarkup, Update};
 
 const HOST: &str = "api.telegram.org";
 const LONG_POLL_TIMEOUT_SECS: u64 = 30;
@@ -23,6 +23,7 @@ const UPLOAD_TIMEOUT_SECS: u64 = 60;
 /// logging setup: it's plain data for the caller to match on, format, or log
 /// however they like.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum TelegramError {
     /// Failed below the HTTP layer (connect, TLS, timeout, non-2xx status, ...).
     Http(HttpError),
@@ -31,6 +32,8 @@ pub enum TelegramError {
         error_code: Option<i64>,
         description: String,
     },
+    /// Telegram asked us to slow down; wait this many seconds before retrying.
+    RateLimited { retry_after: u64 },
     /// The response body wasn't valid JSON, or didn't match the expected shape.
     Json(serde_json::Error),
     /// A local file passed to e.g. [`Telegram::send_photo`] couldn't be read.
@@ -48,6 +51,9 @@ impl std::fmt::Display for TelegramError {
                 Some(code) => write!(f, "Telegram API error {code}: {description}"),
                 None => write!(f, "Telegram API error: {description}"),
             },
+            TelegramError::RateLimited { retry_after } => {
+                write!(f, "rate limited, retry after: {retry_after}")
+            }
             TelegramError::Json(e) => write!(f, "failed to decode response: {e}"),
             TelegramError::Io(e) => write!(f, "failed to read local file: {e}"),
         }
@@ -59,6 +65,7 @@ impl std::error::Error for TelegramError {
         match self {
             TelegramError::Http(e) => Some(e),
             TelegramError::Api { .. } => None,
+            TelegramError::RateLimited { .. } => None,
             TelegramError::Json(e) => Some(e),
             TelegramError::Io(e) => Some(e),
         }
@@ -250,7 +257,8 @@ impl Telegram {
             None,
             Duration::from_secs(LONG_POLL_SOCKET_TIMEOUT_SECS),
         )
-        .await?;
+        .await
+        .map_err(classify_http_error)?;
 
         decode_api_response(&response.body)
     }
@@ -279,7 +287,8 @@ impl Telegram {
             Some(body),
             Duration::from_secs(DEFAULT_TIMEOUT_SECS),
         )
-        .await?;
+        .await
+        .map_err(classify_http_error)?;
 
         let _: serde_json::Value = decode_api_response(&response.body)?;
         Ok(())
@@ -340,7 +349,8 @@ impl Telegram {
             Some(Body::Multipart(form)),
             Duration::from_secs(UPLOAD_TIMEOUT_SECS),
         )
-        .await?;
+        .await
+        .map_err(classify_http_error)?;
 
         let _: serde_json::Value = decode_api_response(&response.body)?;
         Ok(())
@@ -378,7 +388,8 @@ impl Telegram {
             Some(body),
             Duration::from_secs(DEFAULT_TIMEOUT_SECS),
         )
-        .await?;
+        .await
+        .map_err(classify_http_error)?;
 
         let _: serde_json::Value = decode_api_response(&response.body)?;
         Ok(())
@@ -410,7 +421,8 @@ impl Telegram {
             Some(body),
             Duration::from_secs(DEFAULT_TIMEOUT_SECS),
         )
-        .await?;
+        .await
+        .map_err(classify_http_error)?;
 
         let _: serde_json::Value = decode_api_response(&response.body)?;
         Ok(())
@@ -421,10 +433,138 @@ impl Telegram {
     pub async fn get_me(&self) -> Result<Me, TelegramError> {
         let path = self.path("getMe", "");
 
-        let response =
-            http::request(HOST, &path, None, Duration::from_secs(DEFAULT_TIMEOUT_SECS)).await?;
+        let response = http::request(HOST, &path, None, Duration::from_secs(DEFAULT_TIMEOUT_SECS))
+            .await
+            .map_err(classify_http_error)?;
 
         decode_api_response(&response.body)
+    }
+
+    /// Deletes a message. Telegram only allows this within 48 hours for most
+    /// chat types, and the bot needs admin rights in groups/channels to delete
+    /// messages it didn't send itself.
+    pub async fn delete_message(&self, chat_id: i64, message_id: i64) -> Result<(), TelegramError> {
+        let path = self.path("deleteMessage", "");
+
+        let payload = serde_json::json!({
+            "chat_id": chat_id,
+            "message_id": message_id,
+        });
+
+        let body = serde_json::to_vec(&payload)?;
+        let response = http::request(
+            HOST,
+            &path,
+            Some(body),
+            Duration::from_secs(DEFAULT_TIMEOUT_SECS),
+        )
+        .await
+        .map_err(classify_http_error)?;
+
+        let _: serde_json::Value = decode_api_response(&response.body)?;
+        Ok(())
+    }
+
+    /// Edits the text of a previously sent message. Only `parse_mode` and
+    /// `reply_markup` from `options` apply here; Telegram ignores the rest for
+    /// this method.
+    pub async fn edit_message_text(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        text: &str,
+        options: SendMessageOptions,
+    ) -> Result<(), TelegramError> {
+        let path = self.path("editMessageText", "");
+
+        let mut payload = serde_json::json!({
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": text,
+        });
+        options.apply_to_json(&mut payload)?;
+
+        let body = serde_json::to_vec(&payload)?;
+        let response = http::request(
+            HOST,
+            &path,
+            Some(body),
+            Duration::from_secs(DEFAULT_TIMEOUT_SECS),
+        )
+        .await
+        .map_err(classify_http_error)?;
+
+        let _: serde_json::Value = decode_api_response(&response.body)?;
+        Ok(())
+    }
+
+    /// Shows a transient status indicator ("typing...", "uploading photo...")
+    /// in the chat. Telegram clears it automatically after ~5s or on the next
+    /// message, whichever comes first — call it again if an operation takes
+    /// longer.
+    ///
+    /// Common values for `action`: `"typing"`, `"upload_photo"`,
+    /// `"record_video"`, `"upload_video"`, `"upload_document"`,
+    /// `"choose_sticker"`, `"find_location"`.
+    pub async fn send_chat_action(&self, chat_id: i64, action: &str) -> Result<(), TelegramError> {
+        let path = self.path("sendChatAction", "");
+
+        let payload = serde_json::json!({
+            "chat_id": chat_id,
+            "action": action,
+        });
+
+        let body = serde_json::to_vec(&payload)?;
+        let response = http::request(
+            HOST,
+            &path,
+            Some(body),
+            Duration::from_secs(DEFAULT_TIMEOUT_SECS),
+        )
+        .await
+        .map_err(classify_http_error)?;
+
+        let _: serde_json::Value = decode_api_response(&response.body)?;
+        Ok(())
+    }
+
+    /// Calls `getFile` to resolve a `file_id` into a [`File`] with a
+    /// `file_path`. Note: `file_path` is only valid for ~1 hour after this
+    /// call, and Telegram imposes a 20 MB cap on files retrievable this way
+    /// regardless of the file's actual size limit for uploads.
+    pub async fn get_file(&self, file_id: &str) -> Result<File, TelegramError> {
+        let query = format!("file_id={file_id}");
+        let path = self.path("getFile", &query);
+
+        let response = http::request(HOST, &path, None, Duration::from_secs(DEFAULT_TIMEOUT_SECS))
+            .await
+            .map_err(classify_http_error)?;
+
+        decode_api_response(&response.body)
+    }
+
+    /// Downloads the raw bytes of a file previously resolved with
+    /// [`Self::get_file`]. This hits a different host
+    /// (`api.telegram.org/file/...`) than the rest of the Bot API, so it
+    /// does not go through [`Self::path`].
+    pub async fn download_file(&self, file_path: &str) -> Result<Vec<u8>, TelegramError> {
+        let path = format!("/file/bot{}/{}", self.token, file_path);
+
+        let response = http::request(HOST, &path, None, Duration::from_secs(UPLOAD_TIMEOUT_SECS))
+            .await
+            .map_err(classify_http_error)?;
+
+        Ok(response.body)
+    }
+
+    /// Convenience: resolves `file_id` and downloads it in one call.
+    pub async fn download(&self, file_id: &str) -> Result<Vec<u8>, TelegramError> {
+        let file = self.get_file(file_id).await?;
+        let file_path = file.file_path.ok_or_else(|| TelegramError::Api {
+            error_code: None,
+            description: "getFile returned no file_path".to_string(),
+        })?;
+        self.download_file(&file_path).await
     }
 }
 
@@ -449,4 +589,19 @@ where
         error_code: None,
         description: "server reported success but sent no result".to_string(),
     })
+}
+
+fn classify_http_error(err: HttpError) -> TelegramError {
+    if let HttpError::Status(429, ref body) = err {
+        if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(body) {
+            if let Some(retry_after) = parsed
+                .get("parameters")
+                .and_then(|p| p.get("retry_after"))
+                .and_then(|v| v.as_u64())
+            {
+                return TelegramError::RateLimited { retry_after };
+            }
+        }
+    }
+    TelegramError::Http(err)
 }
